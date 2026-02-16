@@ -1,176 +1,286 @@
-# !pip install yfinance tensorflow
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import pandas as pd
+"""
+Stock price prediction with LSTM (AAPL) — CI-friendly version.
+
+Changes:
+- Headless plotting (Agg backend), saves figures to PNG
+- yfinance download with robust fallback to local AAPL.csv
+- Epochs configurable via env var EPOCHS (default 5 for CI)
+"""
+
+import os
+import math
 import numpy as np
+import pandas as pd
+
+# Use a non-interactive backend for CI (no GUI needed)
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-import math
 from sklearn.metrics import mean_squared_error
 
-# ==========================================
-# 1. DATA COLLECTION & VISUALIZATION
-# ==========================================
+# TensorFlow / Keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
 
-# Download AAPL data from Yahoo Finance
-# You can change 'AAPL' to any stock ticker (e.g., 'GOOG', 'TSLA')
-df = yf.download('AAPL', start='2015-01-01', end='2024-01-01')
 
-# Extract only the 'Close' column
-df1 = df['Close']
+# -----------------------------
+# 0. Config
+# -----------------------------
+TICKER = os.getenv("TICKER", "AAPL")
+START_DATE = os.getenv("START_DATE", "2015-01-01")
+END_DATE = os.getenv("END_DATE", "2024-01-01")
+EPOCHS = int(os.getenv("EPOCHS", "5"))       # Keep small for CI; override locally as needed
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
+TIME_STEP = int(os.getenv("TIME_STEP", "100"))
 
-# Plot the original close price
-plt.figure(figsize=(10,6))
-plt.plot(df1)
-plt.title("AAPL Close Price History")
-plt.xlabel('Date')
-plt.ylabel('Close Price USD ($)')
-plt.show()
+PLOT1 = "01_close_history.png"
+PLOT2 = "02_predictions.png"
+PLOT3 = "03_forecast.png"
+METRICS_TXT = "metrics.txt"
 
-# ==========================================
-# 2. DATA PREPROCESSING
-# ==========================================
 
-# LSTM is sensitive to the scale of the data, so we apply MinMax Scaling
-scaler = MinMaxScaler(feature_range=(0,1))
-df1 = scaler.fit_transform(np.array(df1).reshape(-1,1))
+# -----------------------------
+# Util helpers
+# -----------------------------
+def read_local_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Try to read a local CSV containing AAPL price history and return a DataFrame
+    indexed by Date with a 'Close' column.
+    """
+    df = pd.read_csv(csv_path)
+    # Try to set a Date index
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.set_index("Date")
+    else:
+        # Try to interpret the first column as date index if unnamed
+        first_col = df.columns[0]
+        if "date" in first_col.lower():
+            df[first_col] = pd.to_datetime(df[first_col], errors="coerce")
+            df = df.set_index(first_col)
+        else:
+            # If no date column, attempt to parse index
+            try:
+                df.index = pd.to_datetime(df.index, errors="coerce")
+            except Exception:
+                pass
 
-# Split dataset into train and test split (65% Train, 35% Test)
-training_size = int(len(df1) * 0.65)
-test_size = len(df1) - training_size
-train_data, test_data = df1[0:training_size,:], df1[training_size:len(df1),:1]
+    # Normalize to have a 'Close' column
+    if "Close" not in df.columns:
+        # Fall back to 'Adj Close' or last numeric column
+        if "Adj Close" in df.columns:
+            df["Close"] = df["Adj Close"]
+        else:
+            # Pick the last numeric column as Close
+            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+            if not numeric_cols:
+                raise ValueError("CSV does not have numeric columns to use as Close.")
+            df["Close"] = df[numeric_cols[-1]]
 
-# Function to create a dataset matrix with time steps
-# Converts an array of values into a dataset matrix
-def create_dataset(dataset, time_step=1):
+    # Drop rows with invalid dates or Close values
+    df = df.dropna(subset=["Close"])
+    return df
+
+
+def load_data(ticker: str, start: str, end: str, local_csv="AAPL.csv") -> pd.DataFrame:
+    """
+    Try yfinance first. If it fails or returns empty, fall back to local CSV.
+    """
+    df = None
+    err = None
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False)
+        if df is None or df.empty:
+            raise RuntimeError("yfinance returned empty dataframe")
+    except Exception as e:
+        err = e
+        print(f"yfinance failed ({e}), falling back to {local_csv!r}")
+
+    if df is None or df.empty:
+        if not os.path.exists(local_csv):
+            raise FileNotFoundError(
+                f"Local CSV fallback '{local_csv}' not found, and yfinance failed. "
+                f"Please add {local_csv} to the repo or fix SSL/trust chain."
+            )
+        df = read_local_csv(local_csv)
+
+    # Ensure sorted by date
+    df = df.sort_index()
+    if df.empty:
+        raise ValueError("Loaded dataframe is empty after processing.")
+    return df
+
+
+def create_dataset(dataset: np.ndarray, time_step: int = 1):
+    """
+    Converts a sequence array into samples of length 'time_step' and corresponding labels.
+    """
     dataX, dataY = [], []
-    for i in range(len(dataset)-time_step-1):
-        a = dataset[i:(i+time_step), 0]   # i=0, 0,1,2,3-----99   100 
+    for i in range(len(dataset) - time_step - 1):
+        a = dataset[i : (i + time_step), 0]
         dataX.append(a)
         dataY.append(dataset[i + time_step, 0])
     return np.array(dataX), np.array(dataY)
 
-# Reshape into X=t, t+1, t+2...t+99 and Y=t+100
-time_step = 100
-X_train, y_train = create_dataset(train_data, time_step)
-X_test, ytest = create_dataset(test_data, time_step)
 
-# Reshape input to be [samples, time steps, features] which is required for LSTM
+def save_plot(fname: str, title: str = None):
+    """Save current matplotlib figure and close it."""
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.savefig(fname, bbox_inches="tight", dpi=150)
+    plt.close()
+
+
+# -----------------------------
+# 1. Data loading & visualization
+# -----------------------------
+df = load_data(TICKER, START_DATE, END_DATE, local_csv="AAPL.csv")
+
+# Extract Close series
+close_series = df["Close"].astype(float)
+
+# Plot Close price history
+plt.figure(figsize=(10, 6))
+plt.plot(close_series)
+plt.xlabel("Date")
+plt.ylabel("Close Price USD ($)")
+save_plot(PLOT1, f"{TICKER} Close Price History")
+
+
+# -----------------------------
+# 2. Data preprocessing
+# -----------------------------
+scaler = MinMaxScaler(feature_range=(0, 1))
+close_scaled = scaler.fit_transform(np.array(close_series).reshape(-1, 1))
+
+training_size = int(len(close_scaled) * 0.65)
+train_data = close_scaled[0:training_size, :]
+test_data = close_scaled[training_size:, :]
+
+# Create supervised datasets
+X_train, y_train = create_dataset(train_data, TIME_STEP)
+X_test, ytest = create_dataset(test_data, TIME_STEP)
+
+# Reshape inputs to [samples, time steps, features]
 X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
 X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
 print(f"Training Shape: {X_train.shape}")
 print(f"Testing Shape: {X_test.shape}")
 
-# ==========================================
-# 3. BUILD AND TRAIN LSTM MODEL
-# ==========================================
+if X_train.size == 0 or X_test.size == 0:
+    raise ValueError(
+        "Not enough data to create training/testing sequences. "
+        f"length={len(close_scaled)}, time_step={TIME_STEP}"
+    )
 
+
+# -----------------------------
+# 3. Build and train LSTM model
+# -----------------------------
 model = Sequential()
-# Layer 1
-model.add(LSTM(50, return_sequences=True, input_shape=(100,1)))
-# Layer 2
+model.add(LSTM(50, return_sequences=True, input_shape=(TIME_STEP, 1)))
 model.add(LSTM(50, return_sequences=True))
-# Layer 3
 model.add(LSTM(50))
-# Output Layer
 model.add(Dense(1))
-
-model.compile(loss='mean_squared_error', optimizer='adam')
+model.compile(loss="mean_squared_error", optimizer="adam")
 
 model.summary()
 
-# Train the model
-# Note: You can adjust epochs and batch_size based on your computational power
-model.fit(X_train, y_train, validation_data=(X_test, ytest), epochs=100, batch_size=64, verbose=1)
+model.fit(
+    X_train,
+    y_train,
+    validation_data=(X_test, ytest),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    verbose=1,
+)
 
-# ==========================================
-# 4. PREDICTION AND EVALUATION
-# ==========================================
 
-# Lets Do the prediction
+# -----------------------------
+# 4. Prediction & evaluation
+# -----------------------------
 train_predict = model.predict(X_train)
 test_predict = model.predict(X_test)
 
-# Transform back to original form
-train_predict = scaler.inverse_transform(train_predict)
-test_predict = scaler.inverse_transform(test_predict)
+# Inverse transform to original scale
+train_predict_inv = scaler.inverse_transform(train_predict)
+test_predict_inv = scaler.inverse_transform(test_predict)
 y_train_inv = scaler.inverse_transform(y_train.reshape(-1, 1))
 ytest_inv = scaler.inverse_transform(ytest.reshape(-1, 1))
 
-# Calculate RMSE performance metrics
-train_rmse = math.sqrt(mean_squared_error(y_train_inv, train_predict))
-test_rmse = math.sqrt(mean_squared_error(ytest_inv, test_predict))
+train_rmse = math.sqrt(mean_squared_error(y_train_inv, train_predict_inv))
+test_rmse = math.sqrt(mean_squared_error(ytest_inv, test_predict_inv))
 
-print(f"Train RMSE: {train_rmse}")
-print(f"Test RMSE: {test_rmse}")
+print(f"Train RMSE: {train_rmse:.4f}")
+print(f"Test  RMSE: {test_rmse:.4f}")
 
-# Plotting
-# Shift train predictions for plotting
-look_back = 100
-trainPredictPlot = np.empty_like(df1)
-trainPredictPlot[:, :] = np.nan
-trainPredictPlot[look_back:len(train_predict)+look_back, :] = train_predict
+# Save metrics to a file (handy to archive in Jenkins)
+with open(METRICS_TXT, "w", encoding="utf-8") as f:
+    f.write(f"Train_RMSE={train_rmse:.6f}\n")
+    f.write(f"Test_RMSE={test_rmse:.6f}\n")
 
-# Shift test predictions for plotting
-testPredictPlot = np.empty_like(df1)
-testPredictPlot[:, :] = np.nan
-testPredictPlot[len(train_predict)+(look_back*2)+1:len(df1)-1, :] = test_predict
+# Build arrays for plotting predictions vs original
+look_back = TIME_STEP
+full_len = len(close_scaled)
 
-# Plot baseline and predictions
-plt.figure(figsize=(12,6))
-plt.plot(scaler.inverse_transform(df1), label='Original Data')
-plt.plot(trainPredictPlot, label='Train Prediction')
-plt.plot(testPredictPlot, label='Test Prediction')
-plt.title("Model Predictions vs Actual Data")
+trainPredictPlot = np.empty((full_len, 1))
+trainPredictPlot[:] = np.nan
+trainPredictPlot[look_back : len(train_predict_inv) + look_back, :] = train_predict_inv
+
+testPredictPlot = np.empty((full_len, 1))
+testPredictPlot[:] = np.nan
+test_start = len(train_predict_inv) + (look_back * 2) + 1
+test_end = full_len - 1
+# Guard indices
+if test_start < test_end and len(test_predict_inv) > 0:
+    testPredictPlot[test_start:test_start + len(test_predict_inv), :] = test_predict_inv
+
+plt.figure(figsize=(12, 6))
+plt.plot(scaler.inverse_transform(close_scaled), label="Original Data")
+plt.plot(trainPredictPlot, label="Train Prediction")
+plt.plot(testPredictPlot, label="Test Prediction")
 plt.legend()
-plt.show()
+save_plot(PLOT2, "Model Predictions vs Actual Data")
 
-# ==========================================
-# 5. FORECASTING NEXT 30 DAYS
-# ==========================================
 
-# Taking the last 100 days data from the test data to predict the future
-x_input = test_data[len(test_data)-100:].reshape(1,-1)
-temp_input = list(x_input)
-temp_input = temp_input[0].tolist()
+# -----------------------------
+# 5. Forecast next N days (e.g., 30)
+# -----------------------------
+forecast_days = int(os.getenv("FORECAST_DAYS", "30"))
 
-# Logic to predict the next 30 days
+# Use last TIME_STEP points from test_data as seed
+seed = test_data[-TIME_STEP:].reshape(1, -1)
+temp_input = seed.flatten().tolist()
+
 lst_output = []
-n_steps = 100
-i = 0
+n_steps = TIME_STEP
 
-while(i < 30):
-    if(len(temp_input) > 100):
-        x_input = np.array(temp_input[1:])
-        x_input = x_input.reshape(1, -1)
-        x_input = x_input.reshape((1, n_steps, 1))
-        
-        yhat = model.predict(x_input, verbose=0)
-        
-        temp_input.extend(yhat[0].tolist())
-        temp_input = temp_input[1:]
-        lst_output.extend(yhat.tolist())
-        i = i + 1
-    else:
-        x_input = x_input.reshape((1, n_steps, 1))
-        yhat = model.predict(x_input, verbose=0)
-        
-        temp_input.extend(yhat[0].tolist())
-        lst_output.extend(yhat.tolist())
-        i = i + 1
+for i in range(forecast_days):
+    x_input = np.array(temp_input[-n_steps:]).reshape(1, n_steps, 1)
+    yhat = model.predict(x_input, verbose=0)
+    temp_input.extend(yhat.flatten().tolist())
+    lst_output.extend(yhat.flatten().tolist())
 
-# Creating a new plot for the forecast
-day_new = np.arange(1, 101)
-day_pred = np.arange(101, 131)
+# Build arrays for plotting forecast (in original scale)
+history = scaler.inverse_transform(np.array(temp_input[:n_steps]).reshape(-1, 1))
+forecast = scaler.inverse_transform(np.array(lst_output).reshape(-1, 1))
 
-plt.figure(figsize=(10,6))
-# Plotting the last 100 days of real data
-plt.plot(day_new, scaler.inverse_transform(df1[len(df1)-100:]), label='History (Last 100 Days)')
-# Plotting the predicted 30 days
-plt.plot(day_pred, scaler.inverse_transform(lst_output), label='Forecast (Next 30 Days)')
-plt.title("30 Day Future Forecast")
+day_new = np.arange(1, n_steps + 1)
+day_pred = np.arange(n_steps + 1, n_steps + 1 + forecast_days)
+
+plt.figure(figsize=(10, 6))
+plt.plot(day_new, history, label=f"History (Last {n_steps} days)")
+plt.plot(day_pred, forecast, label=f"Forecast (Next {forecast_days} days)")
 plt.legend()
-plt.show()
+save_plot(PLOT3, f"{TICKER} {forecast_days}-Day Forecast")
+
+print(f"Saved plots: {PLOT1}, {PLOT2}, {PLOT3}")
+print(f"Saved metrics: {METRICS_TXT}")
