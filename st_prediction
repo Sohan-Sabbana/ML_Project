@@ -4,10 +4,12 @@
 """
 Stock price prediction with LSTM (AAPL) — CI-friendly version.
 
-Changes:
-- Headless plotting (Agg backend), saves figures to PNG
-- yfinance download with robust fallback to local AAPL.csv
-- Epochs configurable via env var EPOCHS (default 5 for CI)
+Features:
+- Robust local CSV loader (lowercase column names handled)
+- Automatic fallback when yfinance fails (Jenkins SSL issue)
+- Headless plotting (Agg backend) & PNG output
+- Configurable EPOCHS, TIME_STEP for fast CI runs
+- Works in Jenkins & Google Colab reliably
 """
 
 import os
@@ -15,7 +17,7 @@ import math
 import numpy as np
 import pandas as pd
 
-# Use a non-interactive backend for CI (no GUI needed)
+# Headless plotting for Jenkins
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,7 +26,6 @@ import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 
-# TensorFlow / Keras
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
 
@@ -35,9 +36,10 @@ from tensorflow.keras.layers import Dense, LSTM
 TICKER = os.getenv("TICKER", "AAPL")
 START_DATE = os.getenv("START_DATE", "2015-01-01")
 END_DATE = os.getenv("END_DATE", "2024-01-01")
-EPOCHS = int(os.getenv("EPOCHS", "5"))       # Keep small for CI; override locally as needed
+EPOCHS = int(os.getenv("EPOCHS", "5"))       # Small for CI
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
 TIME_STEP = int(os.getenv("TIME_STEP", "100"))
+FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "30"))
 
 PLOT1 = "01_close_history.png"
 PLOT2 = "02_predictions.png"
@@ -46,91 +48,65 @@ METRICS_TXT = "metrics.txt"
 
 
 # -----------------------------
-# Util helpers
+# CSV Loader that handles lowercase names
 # -----------------------------
 def read_local_csv(csv_path: str) -> pd.DataFrame:
     """
-    Try to read a local CSV containing AAPL price history and return a DataFrame
-    indexed by Date with a 'Close' column.
+    Reads AAPL.csv reliably by cleaning/normalizing headers.
     """
     df = pd.read_csv(csv_path)
-    # Try to set a Date index
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.set_index("Date")
-    else:
-        # Try to interpret the first column as date index if unnamed
-        first_col = df.columns[0]
-        if "date" in first_col.lower():
-            df[first_col] = pd.to_datetime(df[first_col], errors="coerce")
-            df = df.set_index(first_col)
-        else:
-            # If no date column, attempt to parse index
-            try:
-                df.index = pd.to_datetime(df.index, errors="coerce")
-            except Exception:
-                pass
 
-    # Normalize to have a 'Close' column
-    if "Close" not in df.columns:
-        # Fall back to 'Adj Close' or last numeric column
-        if "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
-        else:
-            # Pick the last numeric column as Close
-            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-            if not numeric_cols:
-                raise ValueError("CSV does not have numeric columns to use as Close.")
-            df["Close"] = df[numeric_cols[-1]]
+    # Normalize headers to lowercase
+    df.columns = [c.lower() for c in df.columns]
 
-    # Drop rows with invalid dates or Close values
-    df = df.dropna(subset=["Close"])
-    return df
+    # --- Fix date column ---
+    if "date" not in df.columns:
+        raise ValueError("CSV must contain a 'date' column.")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.set_index("date")
 
-
-def load_data(ticker: str, start: str, end: str, local_csv="AAPL.csv") -> pd.DataFrame:
-    """
-    Try yfinance first. If it fails or returns empty, fall back to local CSV.
-    """
-    df = None
-    err = None
-    try:
-        df = yf.download(ticker, start=start, end=end, progress=False)
-        if df is None or df.empty:
-            raise RuntimeError("yfinance returned empty dataframe")
-    except Exception as e:
-        err = e
-        print(f"yfinance failed ({e}), falling back to {local_csv!r}")
-
-    if df is None or df.empty:
-        if not os.path.exists(local_csv):
-            raise FileNotFoundError(
-                f"Local CSV fallback '{local_csv}' not found, and yfinance failed. "
-                f"Please add {local_csv} to the repo or fix SSL/trust chain."
-            )
-        df = read_local_csv(local_csv)
+    # --- Fix close column ---
+    if "close" not in df.columns:
+        raise ValueError("CSV must contain a 'close' column.")
+    df = df[~df["close"].isna()]
 
     # Ensure sorted by date
     df = df.sort_index()
-    if df.empty:
-        raise ValueError("Loaded dataframe is empty after processing.")
+
+    print("DEBUG: CSV Loaded OK. Shape:", df.shape)
+    print(df.head())
+
     return df
 
 
-def create_dataset(dataset: np.ndarray, time_step: int = 1):
-    """
-    Converts a sequence array into samples of length 'time_step' and corresponding labels.
-    """
+# -----------------------------
+# Load data (yfinance → fallback to CSV)
+# -----------------------------
+def load_data(ticker, start, end, csv_path="AAPL.csv"):
+    df = None
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False)
+        if df is None or df.empty:
+            raise Exception("Empty data from yfinance.")
+    except Exception as e:
+        print(f"yfinance failed ({e}), using local CSV '{csv_path}'")
+        df = read_local_csv(csv_path)
+
+    return df
+
+
+# -----------------------------
+# Convert series to supervised dataset
+# -----------------------------
+def create_dataset(dataset, time_step=1):
     dataX, dataY = [], []
     for i in range(len(dataset) - time_step - 1):
-        a = dataset[i : (i + time_step), 0]
-        dataX.append(a)
+        dataX.append(dataset[i:(i + time_step), 0])
         dataY.append(dataset[i + time_step, 0])
     return np.array(dataX), np.array(dataY)
 
 
-def save_plot(fname: str, title: str = None):
-    """Save current matplotlib figure and close it."""
+def save_plot(fname, title=None):
     if title:
         plt.title(title)
     plt.tight_layout()
@@ -139,14 +115,14 @@ def save_plot(fname: str, title: str = None):
 
 
 # -----------------------------
-# 1. Data loading & visualization
+# 1. Load data
 # -----------------------------
-df = load_data(TICKER, START_DATE, END_DATE, local_csv="AAPL.csv")
+df = load_data(TICKER, START_DATE, END_DATE, csv_path="AAPL.csv")
 
-# Extract Close series
-close_series = df["Close"].astype(float)
+# Use only the Close column
+close_series = df["close"].astype(float)
 
-# Plot Close price history
+# Plot Close history
 plt.figure(figsize=(10, 6))
 plt.plot(close_series)
 plt.xlabel("Date")
@@ -155,43 +131,44 @@ save_plot(PLOT1, f"{TICKER} Close Price History")
 
 
 # -----------------------------
-# 2. Data preprocessing
+# 2. Preprocessing
 # -----------------------------
 scaler = MinMaxScaler(feature_range=(0, 1))
 close_scaled = scaler.fit_transform(np.array(close_series).reshape(-1, 1))
 
 training_size = int(len(close_scaled) * 0.65)
-train_data = close_scaled[0:training_size, :]
-test_data = close_scaled[training_size:, :]
+train_data = close_scaled[:training_size]
+test_data = close_scaled[training_size:]
 
-# Create supervised datasets
+# Supervised sequences
 X_train, y_train = create_dataset(train_data, TIME_STEP)
 X_test, ytest = create_dataset(test_data, TIME_STEP)
 
-# Reshape inputs to [samples, time steps, features]
-X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+# Reshape for LSTM
+X_train = X_train.reshape(X_train.shape[0], TIME_STEP, 1)
+X_test = X_test.reshape(X_test.shape[0], TIME_STEP, 1)
 
-print(f"Training Shape: {X_train.shape}")
-print(f"Testing Shape: {X_test.shape}")
+print("Training Shape:", X_train.shape)
+print("Testing  Shape:", X_test.shape)
 
-if X_train.size == 0 or X_test.size == 0:
+if len(X_train) == 0:
     raise ValueError(
-        "Not enough data to create training/testing sequences. "
-        f"length={len(close_scaled)}, time_step={TIME_STEP}"
+        f"Not enough rows in CSV to build sequences with TIME_STEP={TIME_STEP}. "
+        f"Rows={len(close_series)}"
     )
 
 
 # -----------------------------
-# 3. Build and train LSTM model
+# 3. Build + Train Model
 # -----------------------------
-model = Sequential()
-model.add(LSTM(50, return_sequences=True, input_shape=(TIME_STEP, 1)))
-model.add(LSTM(50, return_sequences=True))
-model.add(LSTM(50))
-model.add(Dense(1))
-model.compile(loss="mean_squared_error", optimizer="adam")
+model = Sequential([
+    LSTM(50, return_sequences=True, input_shape=(TIME_STEP, 1)),
+    LSTM(50, return_sequences=True),
+    LSTM(50),
+    Dense(1)
+])
 
+model.compile(loss="mean_squared_error", optimizer="adam")
 model.summary()
 
 model.fit(
@@ -200,87 +177,83 @@ model.fit(
     validation_data=(X_test, ytest),
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    verbose=1,
+    verbose=1
 )
 
 
 # -----------------------------
-# 4. Prediction & evaluation
+# 4. Predictions
 # -----------------------------
-train_predict = model.predict(X_train)
-test_predict = model.predict(X_test)
+train_pred = model.predict(X_train)
+test_pred = model.predict(X_test)
 
-# Inverse transform to original scale
-train_predict_inv = scaler.inverse_transform(train_predict)
-test_predict_inv = scaler.inverse_transform(test_predict)
+# Reverse scaling
+train_pred_inv = scaler.inverse_transform(train_pred)
+test_pred_inv = scaler.inverse_transform(test_pred)
 y_train_inv = scaler.inverse_transform(y_train.reshape(-1, 1))
 ytest_inv = scaler.inverse_transform(ytest.reshape(-1, 1))
 
-train_rmse = math.sqrt(mean_squared_error(y_train_inv, train_predict_inv))
-test_rmse = math.sqrt(mean_squared_error(ytest_inv, test_predict_inv))
+# RMSE
+train_rmse = math.sqrt(mean_squared_error(y_train_inv, train_pred_inv))
+test_rmse = math.sqrt(mean_squared_error(ytest_inv, test_pred_inv))
 
-print(f"Train RMSE: {train_rmse:.4f}")
-print(f"Test  RMSE: {test_rmse:.4f}")
-
-# Save metrics to a file (handy to archive in Jenkins)
-with open(METRICS_TXT, "w", encoding="utf-8") as f:
+with open(METRICS_TXT, "w") as f:
     f.write(f"Train_RMSE={train_rmse:.6f}\n")
     f.write(f"Test_RMSE={test_rmse:.6f}\n")
 
-# Build arrays for plotting predictions vs original
-look_back = TIME_STEP
+print("Train RMSE:", train_rmse)
+print("Test  RMSE:", test_rmse)
+
+
+# -----------------------------
+# 5. Plot Predictions
+# -----------------------------
 full_len = len(close_scaled)
+look_back = TIME_STEP
 
-trainPredictPlot = np.empty((full_len, 1))
-trainPredictPlot[:] = np.nan
-trainPredictPlot[look_back : len(train_predict_inv) + look_back, :] = train_predict_inv
+trainPlot = np.empty((full_len, 1))
+trainPlot[:] = np.nan
+trainPlot[look_back:look_back + len(train_pred_inv), :] = train_pred_inv
 
-testPredictPlot = np.empty((full_len, 1))
-testPredictPlot[:] = np.nan
-test_start = len(train_predict_inv) + (look_back * 2) + 1
-test_end = full_len - 1
-# Guard indices
-if test_start < test_end and len(test_predict_inv) > 0:
-    testPredictPlot[test_start:test_start + len(test_predict_inv), :] = test_predict_inv
+testPlot = np.empty((full_len, 1))
+testPlot[:] = np.nan
+start = len(train_pred_inv) + look_back * 2 + 1
+if start < full_len:
+    testPlot[start:start + len(test_pred_inv), :] = test_pred_inv
 
 plt.figure(figsize=(12, 6))
-plt.plot(scaler.inverse_transform(close_scaled), label="Original Data")
-plt.plot(trainPredictPlot, label="Train Prediction")
-plt.plot(testPredictPlot, label="Test Prediction")
+plt.plot(scaler.inverse_transform(close_scaled), label="Original")
+plt.plot(trainPlot, label="Train Prediction")
+plt.plot(testPlot, label="Test Prediction")
 plt.legend()
-save_plot(PLOT2, "Model Predictions vs Actual Data")
+save_plot(PLOT2, "Predictions vs Actual")
 
 
 # -----------------------------
-# 5. Forecast next N days (e.g., 30)
+# 6. Forecast future
 # -----------------------------
-forecast_days = int(os.getenv("FORECAST_DAYS", "30"))
+x_input = test_data[-TIME_STEP:].reshape(1, -1)
+temp_input = x_input.flatten().tolist()
+output = []
 
-# Use last TIME_STEP points from test_data as seed
-seed = test_data[-TIME_STEP:].reshape(1, -1)
-temp_input = seed.flatten().tolist()
+for _ in range(FORECAST_DAYS):
+    x = np.array(temp_input[-TIME_STEP:]).reshape(1, TIME_STEP, 1)
+    yhat = model.predict(x, verbose=0)
+    temp_input.append(yhat[0][0])
+    output.append(yhat[0][0])
 
-lst_output = []
-n_steps = TIME_STEP
-
-for i in range(forecast_days):
-    x_input = np.array(temp_input[-n_steps:]).reshape(1, n_steps, 1)
-    yhat = model.predict(x_input, verbose=0)
-    temp_input.extend(yhat.flatten().tolist())
-    lst_output.extend(yhat.flatten().tolist())
-
-# Build arrays for plotting forecast (in original scale)
-history = scaler.inverse_transform(np.array(temp_input[:n_steps]).reshape(-1, 1))
-forecast = scaler.inverse_transform(np.array(lst_output).reshape(-1, 1))
-
-day_new = np.arange(1, n_steps + 1)
-day_pred = np.arange(n_steps + 1, n_steps + 1 + forecast_days)
+history = scaler.inverse_transform(
+    np.array(temp_input[:TIME_STEP]).reshape(-1, 1)
+)
+forecast = scaler.inverse_transform(
+    np.array(output).reshape(-1, 1)
+)
 
 plt.figure(figsize=(10, 6))
-plt.plot(day_new, history, label=f"History (Last {n_steps} days)")
-plt.plot(day_pred, forecast, label=f"Forecast (Next {forecast_days} days)")
+plt.plot(range(1, TIME_STEP + 1), history, label="History")
+plt.plot(range(TIME_STEP + 1, TIME_STEP + 1 + FORECAST_DAYS), forecast, label="Forecast")
 plt.legend()
-save_plot(PLOT3, f"{TICKER} {forecast_days}-Day Forecast")
+save_plot(PLOT3, f"{FORECAST_DAYS}-Day Forecast")
 
-print(f"Saved plots: {PLOT1}, {PLOT2}, {PLOT3}")
-print(f"Saved metrics: {METRICS_TXT}")
+print(f"Saved: {PLOT1}, {PLOT2}, {PLOT3}")
+print(f"Metrics saved: {METRICS_TXT}")
